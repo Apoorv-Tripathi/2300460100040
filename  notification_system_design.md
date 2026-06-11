@@ -245,3 +245,71 @@ WHERE student_id = $1 AND is_read = FALSE;
 ```
 
 ---
+
+# Stage 3
+
+## Is the query accurate?
+
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+Functionally it returns the right rows but there are issues:
+
+- `SELECT *` fetches every column including ones the frontend never uses
+- `ORDER BY createdAt ASC` shows oldest first — most UIs want newest first
+- No LIMIT, so if student 1042 has 10,000 unread notifications, all of them get returned at once
+
+---
+
+## Why is it slow?
+
+No index on `studentID` or `isRead` means Postgres does a full sequential scan through all 5 million rows just to find notifications for one student. At that scale it's scanning gigabytes of data for every single request.
+
+---
+
+## Fixed query
+
+```sql
+SELECT id, notification_type, message, is_read, created_at
+FROM notifications
+WHERE student_id = 1042 AND is_read = FALSE
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+**Index to add:**
+
+```sql
+CREATE INDEX idx_notif_student_unread_created
+  ON notifications(student_id, is_read, created_at DESC)
+  WHERE is_read = FALSE;
+```
+
+With this index, Postgres jumps straight to student 1042's unread rows — no full scan. Query goes from seconds to milliseconds.
+
+---
+
+## Should we index every column?
+
+No, that's actually harmful. Every index has to be updated on every INSERT and UPDATE. With 5M rows and frequent writes (new notifications, mark-reads), indexing every column will slow down writes significantly and waste disk space. The query planner can also get confused and pick wrong indexes.
+
+Only index columns that appear in WHERE, ORDER BY, or JOIN conditions. Here that's `student_id`, `is_read`, `created_at`, and `notification_type`.
+
+---
+
+## Students who got a Placement notification in the last 7 days
+
+```sql
+SELECT DISTINCT s.id, s.name, s.email
+FROM students s
+JOIN notifications n ON n.student_id = s.id
+WHERE n.notification_type = 'Placement'
+  AND n.created_at >= NOW() - INTERVAL '7 days';
+```
+
+The index on `(notification_type, created_at DESC)` makes this efficient.
+
+---
