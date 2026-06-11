@@ -313,3 +313,55 @@ WHERE n.notification_type = 'Placement'
 The index on `(notification_type, created_at DESC)` makes this efficient.
 
 ---
+
+# Stage 4
+
+## Problem
+
+Fetching notifications fresh from the DB on every single page load. With 50K students, even if only 10% are active at once, that's 5,000 DB queries hitting at the same time. The DB can't handle that.
+
+---
+
+## Solutions
+
+### 1. Redis Cache (main fix)
+
+Cache each student's notification list in Redis.
+
+```
+Key:   notifications:student:<studentId>
+Value: JSON array
+TTL:   60 seconds
+```
+
+On page load, check Redis first. Only go to DB on a cache miss, then populate Redis. On new notification or mark-read, delete that student's cache key.
+
+Tradeoffs: Reduces DB load by 80-90%. Sub-millisecond reads. The downside is stale data — a new notification might take up to 60s to show if the cache isn't invalidated properly. Also need to manage memory if the student base grows further.
+
+---
+
+### 2. Pagination
+
+Never load all notifications at once. Always use LIMIT/OFFSET or cursor-based pagination.
+
+Tradeoffs: Simple to implement, no extra infrastructure. Doesn't fully solve the problem if thousands of students hit page 1 simultaneously — still 1000 DB queries. Combine with caching.
+
+---
+
+### 3. Read Replicas
+
+All GET requests go to a read replica. Writes go to primary only.
+
+Tradeoffs: Offloads the primary DB completely for reads. Can add more replicas as traffic grows. Downside is replication lag (100-500ms) so a student might not see their notification immediately after it's created.
+
+---
+
+### 4. WebSocket push instead of fetch-on-load
+
+After the initial load, don't poll. Keep the WebSocket connection open. New notifications get pushed to the client directly and added to the local state.
+
+Tradeoffs: Zero extra DB queries for new notifications after initial load. Best UX. But the initial load still hits the DB, and managing 50K concurrent WebSocket connections needs a Redis pub/sub adapter (like Socket.IO with Redis adapter) plus proper load balancing.
+
+**Recommended approach:** Redis cache + pagination + WebSocket push. Read replicas when the traffic justifies the infrastructure cost.
+
+---
