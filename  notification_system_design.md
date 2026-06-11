@@ -146,3 +146,102 @@ Went with WebSockets over polling or SSE because the connection is persistent an
 4. Client receives it and updates the UI without any page reload.
 
 ---
+
+# Stage 2
+
+## DB Choice — PostgreSQL
+
+Going with PostgreSQL. The data here is clearly relational — students have notifications, notifications have types, reads are tracked per student. PostgreSQL handles this well and gives us proper ENUM support for notification types, partial indexes (useful for unread-only queries), and it's battle-tested for this kind of workload.
+
+MongoDB would add complexity without any real benefit here — the schema is fixed and we're not storing arbitrary nested documents.
+
+---
+
+## Schema
+
+```sql
+CREATE TYPE notification_type AS ENUM ('Event', 'Result', 'Placement');
+
+CREATE TABLE students (
+  id         SERIAL PRIMARY KEY,
+  name       VARCHAR(255) NOT NULL,
+  email      VARCHAR(255) UNIQUE NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE notifications (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  student_id        INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+  notification_type notification_type NOT NULL,
+  message           TEXT NOT NULL,
+  is_read           BOOLEAN DEFAULT FALSE,
+  created_at        TIMESTAMP DEFAULT NOW(),
+  updated_at        TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_notif_student ON notifications(student_id);
+CREATE INDEX idx_notif_created ON notifications(created_at DESC);
+CREATE INDEX idx_notif_student_unread ON notifications(student_id, is_read) WHERE is_read = FALSE;
+CREATE INDEX idx_notif_type_created ON notifications(notification_type, created_at DESC);
+```
+
+---
+
+## Problems at scale and how to fix them
+
+**50K students, 5M notifications — what breaks:**
+
+- Full table scans on unindexed columns will make every query slow. Fix: composite indexes on `(student_id, is_read, created_at)`.
+- `SELECT *` pulls every column on every query. Fix: only select what the frontend actually needs.
+- Table keeps growing forever. Fix: partition by `created_at` monthly so old data doesn't slow down current queries.
+- Every page load hits the DB. Fix: Redis cache per student with 60s TTL. Invalidate on new notification or mark-read.
+- Single DB handles all reads and writes. Fix: read replicas for all GET endpoints, primary only for writes.
+- Unread count re-queried constantly. Fix: store it in Redis, decrement/increment on read events.
+
+---
+
+## Queries
+
+**All notifications for a student (paginated)**
+
+```sql
+SELECT id, notification_type, message, is_read, created_at
+FROM notifications
+WHERE student_id = $1
+ORDER BY created_at DESC
+LIMIT $2 OFFSET $3;
+```
+
+**Unread notifications for a student**
+
+```sql
+SELECT id, notification_type, message, created_at
+FROM notifications
+WHERE student_id = $1 AND is_read = FALSE
+ORDER BY created_at DESC;
+```
+
+**Mark one as read**
+
+```sql
+UPDATE notifications
+SET is_read = TRUE, updated_at = NOW()
+WHERE id = $1 AND student_id = $2;
+```
+
+**Unread count**
+
+```sql
+SELECT COUNT(*) FROM notifications
+WHERE student_id = $1 AND is_read = FALSE;
+```
+
+**Mark all as read**
+
+```sql
+UPDATE notifications
+SET is_read = TRUE, updated_at = NOW()
+WHERE student_id = $1 AND is_read = FALSE;
+```
+
+---
