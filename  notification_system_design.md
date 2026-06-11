@@ -365,3 +365,84 @@ Tradeoffs: Zero extra DB queries for new notifications after initial load. Best 
 **Recommended approach:** Redis cache + pagination + WebSocket push. Read replicas when the traffic justifies the infrastructure cost.
 
 ---
+
+# Stage 5
+
+## Problems with the current implementation
+
+```
+function notify_all(student_ids: array, message: string):
+    for student_id in student_ids:
+        send_email(student_id, message)
+        save_to_db(student_id, message)
+        push_to_app(student_id, message)
+```
+
+- It's sequential. 50K students, 100ms per student = 83 minutes. The HR is still waiting next morning.
+- No error handling. Email fails for student 200, loop crashes, students 201-50000 get nothing.
+- Email, DB, and push are tightly coupled. If the email API is down, DB inserts stop too.
+- No retries. Failed sends are gone forever.
+- 50K individual DB inserts instead of one bulk insert.
+
+---
+
+## What about DB save and email — should they happen together?
+
+No. The DB insert is the source of truth and should always succeed regardless of what happens with email. Email is just a delivery channel. If email fails we can retry it, but we can always look up the DB record to know the notification was created. Coupling them means an email provider outage corrupts our data integrity.
+
+---
+
+## Redesigned solution — message queue
+
+Producer enqueues jobs instantly (non-blocking). Worker pool processes them concurrently. DB insert is bulk upfront. Email/push are separate retryable jobs.
+
+```typescript
+async function notify_all(
+  student_ids: string[],
+  message: string,
+): Promise<void> {
+  // Bulk insert to DB first — one query, not 50K
+  await db.notifications.bulkCreate(
+    student_ids.map((id) => ({
+      student_id: id,
+      message,
+      notification_type: "Placement",
+    })),
+  );
+  logger.info(`Bulk inserted ${student_ids.length} notifications`);
+
+  // Enqueue email + push jobs
+  const jobs = student_ids.map((student_id) => ({
+    name: "send-notification",
+    data: { student_id, message },
+    opts: { attempts: 3, backoff: { type: "exponential", delay: 2000 } },
+  }));
+
+  await notificationQueue.addBulk(jobs);
+  logger.info(`Enqueued ${student_ids.length} jobs`);
+}
+
+// Worker runs with concurrency 50 — 50 students processed in parallel
+notificationQueue.process("send-notification", 50, async (job) => {
+  const { student_id, message } = job.data;
+
+  try {
+    await send_email(student_id, message);
+    logger.info(`Email sent`, { student_id });
+  } catch (err) {
+    logger.error(`Email failed`, { student_id, error: err.message });
+    throw err; // triggers retry with backoff
+  }
+
+  try {
+    await push_to_app(student_id, message);
+  } catch (err) {
+    logger.warn(`Push failed`, { student_id, error: err.message });
+    // push failure is non-critical, don't retry
+  }
+});
+```
+
+Now the 200 failed emails are tracked in the queue, can be inspected and retried. The other 49,800 are unaffected. The whole thing finishes in minutes instead of hours.
+
+---
